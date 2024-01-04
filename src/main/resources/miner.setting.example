@@ -1,0 +1,4 @@
+pk =
+sk =
+arbRpcUrls = https://arbitrum.llamarpc.com, https://arb-pokt.nodies.app, https://arbitrum-one.public.blastapi.io, https://arbitrum.meowrpc.com
+threads = 8
