@@ -168,7 +168,7 @@ public class App {
      * @return
      */
     private static String generateRandomString(int length) {
-        String characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        String characters = "abcdefghijklmnopqrstuvwxyz0123456789";
         StringBuilder randomString = new StringBuilder(length);
         SecureRandom secureRandom = new SecureRandom();
 
