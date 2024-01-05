@@ -3,10 +3,13 @@ package cn.ming;
 import app.cash.nostrino.crypto.PubKey;
 import app.cash.nostrino.crypto.SecKey;
 import app.cash.nostrino.model.Event;
+import cn.hutool.cache.impl.TimedCache;
+import cn.hutool.core.util.RandomUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.crypto.SecureUtil;
 import cn.hutool.http.HttpResponse;
 import cn.hutool.http.HttpUtil;
+import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import cn.hutool.log.Log;
 import cn.hutool.log.LogFactory;
@@ -22,6 +25,8 @@ import org.web3j.protocol.core.methods.response.EthBlock;
 import org.web3j.protocol.http.HttpService;
 
 import java.math.BigInteger;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
@@ -45,11 +50,12 @@ public class App {
     private static Integer numberOfWorkers = 8;
     private static String[] arbRpcUrls = new String[0];
     private static String eventId = "";
-    private static String blockHeight = "";
+    private static String blockHeight = "0";
     private static String blockHash = "";
     private static String content = "{\"p\":\"nrc-20\",\"op\":\"mint\",\"tick\":\"noss\",\"amt\":\"10\"}";
 
     private static ExecutorService executorService;
+    private static TimedCache<String, Boolean> cache = new TimedCache<>(300000);
 
     public static void main(String[] args) throws Exception {
         loadConfig();
@@ -62,29 +68,70 @@ public class App {
         SecKey secKey = SecKey.Companion.parse(sk);
 
         while (true) {
-            Event dataEvent = getDataEvent();
-            String nonce = generateRandomString(13);
-            dataEvent.getTags()
-                     .add(List.of("nonce", nonce, "21"));
-            String _id = SecureUtil.sha256(dataEvent.toJson());
-            if (!_id.startsWith("00000")) {
+            if (cache.size() > 1) {
+                Thread.sleep(100);
                 continue;
             }
-            String jsonData = dataEvent.toJson();
-            byte[] bytes = jsonData.getBytes(StandardCharsets.UTF_8);
-            ByteString sign = secKey.sign(ByteString.of(bytes).sha256());
-            Event event = new Event(
-                    ByteString.encodeUtf8(_id),
-                    pubKey.getKey(),
-                    dataEvent.getCreatedAt(),
-                    dataEvent.getKind(),
-                    dataEvent.getTags(),
-                    dataEvent.getContent(),
-                    sign
-            );
-            //log.info(event.toJson());
-            postEvent(_id, event);
+            String requestId = RandomUtil.randomString(16);
+            cache.put(requestId, Boolean.FALSE);
+            for (int i = 0; i < numberOfWorkers; i++) {
+                Runnable task = createTask(requestId, pubKey, secKey);
+                executorService.submit(task);
+            }
         }
+    }
+
+    private static Runnable createTask(String requestId, PubKey pubKey, SecKey secKey) {
+        return () -> {
+            while (true) {
+                if (null == cache.get(requestId) || cache.get(requestId)) {
+                    break;
+                }
+                try {
+                    Event dataEvent = getDataEvent(pubKey);
+                    String nonce = generateRandomString(11);
+                    dataEvent.getTags()
+                             .add(List.of("nonce", nonce, "21"));
+                    JSONObject jsonObject = JSONUtil.parseObj(dataEvent.toJson());
+                    jsonObject.remove("id");
+                    jsonObject.remove("sig");
+                    String _id = SecureUtil.sha256(jsonObject.toString());
+                    if (getPow(_id) < 21) {
+                        continue;
+                    }
+                    ByteString sign = secKey.sign(ByteString.of(_id.getBytes(StandardCharsets.UTF_8)).sha256());
+                    Event event = new Event(
+                            ByteString.encodeUtf8(_id),
+                            dataEvent.getPubKey(),
+                            dataEvent.getCreatedAt(),
+                            dataEvent.getKind(),
+                            dataEvent.getTags(),
+                            dataEvent.getContent(),
+                            sign
+                    );
+                    //log.info(event.toJson());
+                    postEvent(_id, event);
+                    cache.remove(requestId);
+                    break;
+                } catch (Exception e) {
+                    log.error(e);
+                }
+            }
+        };
+    }
+
+    private static int getPow(String hex) {
+        int count = 0;
+        for (int i = 0; i < hex.length(); i++) {
+            int nibble = Integer.parseInt(String.valueOf(hex.charAt(i)), 16);
+            if (nibble == 0) {
+                count += 4;
+            } else {
+                count += Integer.numberOfLeadingZeros(nibble) - 28;
+                break;
+            }
+        }
+        return count;
     }
 
     private static void loadConfig() {
@@ -101,11 +148,12 @@ public class App {
             System.exit(0);
         }
         sk = safeKey;
-        String[] arbRpcUrls = setting.getStrings("arbRpcUrls");
-        if (null == arbRpcUrls || arbRpcUrls.length == 0) {
+        String[] arbRpcUrlList = setting.getStrings("arbRpcUrls");
+        if (null == arbRpcUrlList || arbRpcUrlList.length == 0) {
             log.error("缺少sk配置");
             System.exit(0);
         }
+        arbRpcUrls = arbRpcUrlList;
         Integer threads = setting.getInt("threads");
         if (null != threads) {
             numberOfWorkers = threads;
@@ -132,8 +180,7 @@ public class App {
         return randomString.toString();
     }
 
-    private static Event getDataEvent() {
-        ByteString pubKey = ByteString.encodeUtf8(pk);
+    private static Event getDataEvent(PubKey pubKey) {
         List<List<String>> tags = new ArrayList<>();
         tags.add(List.of("p", "9be107b0d7218c67b4954ee3e6bd9e4dba06ef937a93f684e42f730a0c3d053c"));
         tags.add(List.of("e",
@@ -146,8 +193,8 @@ public class App {
                 "reply"));
         tags.add(List.of("seq_witness", blockHeight, blockHash));
         Event data = new Event(
-                ByteString.encodeUtf8("0"),
-                pubKey,
+                ByteString.EMPTY,
+                pubKey.getKey(),
                 Instant.now(),
                 1,
                 tags,
@@ -165,10 +212,10 @@ public class App {
     }
 
     private static void getLatestArbBlock() {
-        String arbRpcUrl = getArbRpcUrl();
-        Web3j web3j = Web3j.build(new HttpService(arbRpcUrl));
         while (true) {
             try {
+                String arbRpcUrl = getArbRpcUrl();
+                Web3j web3j = Web3j.build(new HttpService(arbRpcUrl));
                 // 获取最新区块
                 EthBlock.Block latestBlock = web3j.ethGetBlockByNumber(DefaultBlockParameterName.LATEST, false)
                                                   .send()
@@ -176,9 +223,11 @@ public class App {
                 // 输出区块信息
                 BigInteger number = latestBlock.getNumber();
                 String hash = latestBlock.getHash();
-                blockHeight = number.toString();
-                blockHash = hash;
-                //log.info("最新EVM区块高度: {}, 区块hash: {}", number, hash);
+                if (number.compareTo(new BigInteger(blockHeight)) > 0) {
+                    blockHeight = number.toString();
+                    blockHash = hash;
+                }
+                log.info("最新EVM区块高度: {}, 区块hash: {}", blockHeight, blockHash);
                 Thread.sleep(50);
             } catch (Exception e) {
                 log.error("获取evm最新区块失败", e);
@@ -228,7 +277,7 @@ public class App {
                 try {
                     // 这里拿eventId
                     eventId = JSONUtil.parseObj(arg0).getStr("eventId");
-                    //log.info("wss onMessage: {}", arg0);
+                    log.info("wss onMessage: {}", arg0);
                 } catch (Exception e) {
                     log.error(e);
                 }
@@ -242,22 +291,21 @@ public class App {
     }
 
     private static void postEvent(String _id, Event event) {
+        JSONObject data = new JSONObject();
+        data.put("event", JSONUtil.parseObj(event.toJson()));
         String url = "https://api-worker.noscription.org/inscribe/postEvent";
+        //Proxy proxy = new Proxy(Proxy.Type.SOCKS, new InetSocketAddress("127.0.0.1", 10809));
         HttpResponse response = HttpUtil.createPost(url)
-                                        .header("authority", "api-worker.noscription.org")
-                                        .header("accept", "application/json, text/plain, */*")
-                                        .header("accept-language", "zh-CN,zh;q=0.9")
-                                        .header("content-type", "application/json")
-                                        .header("origin", "https://noscription.org")
-                                        .header("referer", "https://noscription.org/")
-                                        .header("sec-ch-ua", "\"Not_A Brand\";v=\"8\", \"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\"")
-                                        .header("sec-ch-ua-mobile", "?0")
-                                        .header("sec-ch-ua-platform", "\"macOS\"")
-                                        .header("sec-fetch-dest", "empty")
-                                        .header("sec-fetch-mode", "cors")
-                                        .header("sec-fetch-site", "same-site")
-                                        .header("user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                                        .body(event.toJson())
+                                        //.setProxy(proxy)
+                                        .header("Content-Type", "application/json")
+                                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0")
+                                        .header("Sec-ch-ua", "\"Not A(Brand\";v=\"99\", \"Microsoft Edge\";v=\"121\", \"Chromium\";v=\"121\"")
+                                        .header("Sec-ch-ua-mobile", "?0")
+                                        .header("Sec-ch-ua-platform", "\"Windows\"")
+                                        .header("Sec-fetch-dest", "empty")
+                                        .header("Sec-fetch-mode", "cors")
+                                        .header("Sec-fetch-site", "same-site")
+                                        .body(data.toString())
                                         .execute();
         log.info("post event id: {}, response: {}", _id, response.body());
     }
